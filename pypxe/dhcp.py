@@ -181,7 +181,7 @@ class DHCPD:
                 offer = offer if offer else self.next_ip()
                 self.leases[client_mac]['ip'] = offer
                 self.leases[client_mac]['expire'] = time() + 86400
-                self.logger.debug('New Assignment - MAC: {0} -> IP: {1}'.format(self.get_mac(client_mac), self.leases[client_mac]['ip']))
+                self.logger.info('New Assignment - MAC: {0} -> IP: {1}'.format(self.get_mac(client_mac), self.leases[client_mac]['ip']))
             response += socket.inet_aton(offer) # yiaddr
         else:
             response += socket.inet_aton('0.0.0.0')
@@ -284,13 +284,12 @@ class DHCPD:
     def validate_req(self, client_mac):
         # client request is valid only if contains Vendor-Class = PXEClient
         if self.whitelist and self.get_mac(client_mac) not in self.get_namespaced_static('dhcp.binding'):
-            self.logger.debug('Non-whitelisted client request received')
+            self.logger.info('Non-whitelisted client request received')
             return False
         if 60 in self.leases[client_mac]['options'] and 'PXEClient' in self.leases[client_mac]['options'][60][0]:
-            self.logger.debug('PXE client request received')
+            self.logger.info('PXE client request received')
             return True
-        if self.mode_debug:
-            self.logger.debug('Non-PXE client request received')
+        self.logger.info('Non-PXE client request received')
         return False
 
     def listen(self):
@@ -311,14 +310,14 @@ class DHCPD:
                 continue
             type = ord(self.leases[client_mac]['options'][53][0]) # see RFC2131, page 10
             if type == 1:
-                self.logger.debug('Received DHCPOFFER')
+                self.logger.info('Received DHCPOFFER')
                 try:
                     self.dhcp_offer(message)
                 except OutOfLeasesError:
                     self.logger.critical('Ran out of leases')
             elif type == 3 and address[0] == '0.0.0.0' and not self.mode_proxy:
-                self.logger.debug('Received DHCPACK')
+                self.logger.info('Received DHCPACK')
                 self.dhcp_ack(message)
             elif type == 3 and address[0] != '0.0.0.0' and self.mode_proxy:
-                self.logger.debug('Received DHCPACK')
+                self.logger.info('Received DHCPACK')
                 self.dhcp_ack(message)
