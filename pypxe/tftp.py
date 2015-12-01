@@ -4,6 +4,7 @@ This file contains classes and functions that implement the PyPXE TFTP service
 
 '''
 
+import abc
 import socket
 import struct
 import os
@@ -17,8 +18,11 @@ class ParentSocket(socket.socket):
     parent = None
 
 
-class Client:
+class AbstractClient(object):
     '''Client instance for TFTPD.'''
+
+    __metaclass__ = abc.ABCMeta
+
     def __init__(self, mainsock, parent):
 
         self.default_retries = parent.default_retries
@@ -32,9 +36,9 @@ class Client:
         self.blksize = 512
         self.sent_time = float('inf')
         self.dead = False
-        self.fh = None
+        self.wrap = 0
+        self.filesize = 0
         self.filename = ''
-        self.wrap = -1
 
         # message from the main socket
         self.handle()
@@ -44,15 +48,23 @@ class Client:
         self.message = self.sock.recv(1024)
         self.handle()
 
+    @abc.abstractmethod
+    def next_block(self):
+        '''Return the next block to send to the client.'''
+        pass
+
     def send_block(self):
         '''
             Sends the next block of data, setting the timeout and retry
             variables accordingly.
         '''
-        data = self.fh.read(self.blksize)
+        block = self.next_block()
+        if block is None:
+          self.logger.debug('Got empty block, ignoring')
+          return
         # opcode 3 == DATA, wraparound block number
         response = struct.pack('!HH', 3, self.block % 65536)
-        response += data
+        response += block
         self.sock.sendto(response, self.address)
         self.logger.debug('Sending block {0}'.format(self.block))
         self.retries -= 1
@@ -77,13 +89,18 @@ class Client:
         self.sendError(5, 'Mode {0} not supported'.format(mode))
         return False
 
-    def check_file(self):
+    @abc.abstractmethod
+    def check_file(self, filename):
         '''
             Determines if the file exist and if it is a file; if not,
             send an error.
         '''
+        pass
+
+    def validate_file(self):
+        '''Sets the filename property if the filename is valid.'''
         filename = self.message.split(chr(0))[0]
-        if os.path.lexists(filename) and os.path.isfile(filename):
+        if self.check_file(filename):
             self.filename = filename
             return True
         self.sendError(1, 'File Not Found', filename = filename)
@@ -122,6 +139,13 @@ class Client:
 
         self.sock.sendto(response, self.address)
 
+
+    @abc.abstractmethod
+    def prepare_request(self, filename):
+      '''Do backend dependent actions to prepare for serving a file.'''
+      # Implementations need to set self.filesize here
+      pass
+
     def newRequest(self):
         '''
             When receiving a read request from the parent socket, open our
@@ -134,14 +158,14 @@ class Client:
         # used by select() to find ready clients
         self.sock.parent = self
 
-        if not self.valid_mode() or not self.check_file():
+        if not self.valid_mode() or not self.validate_file():
             # some clients just ACK the error (wrong code?)
             # so forcefully shutdown
             self.complete()
             return
 
-        self.fh = open(self.filename, 'rb')
-        self.filesize = os.path.getsize(self.filename)
+        self.logger.info('New request for "{0}"'.format(self.filename))
+        self.prepare_request(self.filename)
 
         if not self.parse_options():
             # no options recieved so start transfer
@@ -173,18 +197,13 @@ class Client:
         response += message
         response += chr(0)
         self.sock.sendto(response, self.address)
-        self.logger.debug('Sending {0}: {1} {2}'.format(code, message, filename))
+        self.logger.error('Sending {0}: {1} {2}'.format(code, message, filename))
 
     def complete(self):
         '''
-            Closes a file and socket after sending it
+            Closes the socket after sending it
             and marks ourselves as dead to be cleaned up.
         '''
-        try:
-            self.fh.close()
-        except AttributeError:
-            # we have not opened yet or file-not-found
-            pass
         self.sock.close()
         self.dead = True
 
@@ -207,7 +226,7 @@ class Client:
                 if self.filesize % self.blksize == 0:
                     self.block = block + 1
                     self.send_block()
-                self.logger.debug('Completed sending {0}'.format(self.filename))
+                self.logger.info('Completed sending "{0}"'.format(self.filename))
                 self.complete()
             else:
                 self.block = block + 1
@@ -215,15 +234,51 @@ class Client:
                 self.send_block()
 
 
-class TFTPD:
+class FileBackedClient(AbstractClient):
+    '''Client instance backed with local filesystem.'''
+
+    def __init__(self, mainsock, parent):
+        super(FileBackedClient, self).__init__(mainsock, parent)
+        self.fh = None
+
+    def check_file(self, filename):
+        '''
+            Determines if the file exist and if it is a file; if not,
+            send an error.
+        '''
+        if os.path.lexists(filename) and os.path.isfile(filename):
+            return True
+        return False
+
+    def complete(self):
+        '''Closes a file after sending it.'''
+        super(FileBackedClient, self).complete()
+        try:
+            self.fh.close()
+        except AttributeError:
+            # we have not opened yet or file-not-found
+            pass
+
+    def next_block(self):
+        '''Return the next block to send to the client.'''
+        if not self.fh:
+          return None
+        return self.fh.read(self.blksize)
+
+    def prepare_request(self, filename):
+        '''Open file handler in preparation for serving the file.'''
+        self.fh = open(self.filename, 'rb')
+        self.filesize = os.path.getsize(self.filename)
+
+
+class BaseTFTPD(object):
     '''
         This class implements a read-only TFTP server
         implemented from RFC1350 and RFC2348
     '''
-    def __init__(self, **server_settings):
+    def __init__(self, client_cls, **server_settings):
         self.ip = server_settings.get('ip', '0.0.0.0')
         self.port = server_settings.get('port', 69)
-        self.netbook_directory = server_settings.get('netbook_directory', '.')
         self.mode_debug = server_settings.get('mode_debug', False) # debug mode
         self.logger = server_settings.get('logger', None)
         self.default_retries = server_settings.get('default_retries', 3)
@@ -231,6 +286,7 @@ class TFTPD:
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self.sock.bind((self.ip, self.port))
+        self.client_cls = client_cls
 
         # setup logger
         if self.logger == None:
@@ -246,14 +302,8 @@ class TFTPD:
         self.logger.debug('NOTICE: TFTP server started in debug mode. TFTP server is using the following:')
         self.logger.debug('Server IP: {0}'.format(self.ip))
         self.logger.debug('Server Port: {0}'.format(self.port))
-        self.logger.debug('Network Boot Directory: {0}'.format(self.netbook_directory))
 
         self.ongoing = []
-
-        # start in network boot file directory and then chroot,
-        # this simplifies target later as well as offers a slight security increase
-        os.chdir (self.netbook_directory)
-        os.chroot ('.')
 
 
     def listen(self):
@@ -265,7 +315,7 @@ class TFTPD:
             for sock in rlist:
                 if sock == self.sock:
                     # main socket, so new client
-                    self.ongoing.append(Client(sock, self))
+                    self.ongoing.append(self.client_cls(sock, self))
                 else:
                     # client socket, so tell the client object it's ready
                     sock.parent.ready()
@@ -273,3 +323,18 @@ class TFTPD:
             [client.send_block() for client in self.ongoing if client.no_ack()]
             # if we have run out of retries, kill the client
             [client.complete() for client in self.ongoing if client.no_retries()]
+
+
+class TFTPD(BaseTFTPD):
+    '''
+        Implemention of TFTP class with local filesystem as backing storage.
+    '''
+    def __init__(self, **server_settings):
+        super(TFTPD, self).__init__(FileBackedClient, **server_settings)
+        self.netbook_directory = server_settings.get('netbook_directory', '.')
+        self.logger.debug('Network Boot Directory: {0}'.format(self.netbook_directory))
+
+        # start in network boot file directory and then chroot,
+        # this simplifies target later as well as offers a slight security increase
+        os.chdir (self.netbook_directory)
+        os.chroot ('.')
