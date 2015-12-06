@@ -40,9 +40,6 @@ class AbstractClient(object):
         self.filesize = 0
         self.filename = ''
 
-        # message from the main socket
-        self.handle()
-
     def ready(self):
         '''Called when there is something to be read on our socket.'''
         self.message = self.sock.recv(1024)
@@ -86,7 +83,7 @@ class AbstractClient(object):
         '''Determines if the file read mode octet; if not, send an error.'''
         mode = self.message.split(chr(0))[1]
         if mode == 'octet': return True
-        self.sendError(5, 'Mode {0} not supported'.format(mode))
+        self.send_error(5, 'Mode {0} not supported'.format(mode))
         return False
 
     @abc.abstractmethod
@@ -103,7 +100,7 @@ class AbstractClient(object):
         if self.check_file(filename):
             self.filename = filename
             return True
-        self.sendError(1, 'File Not Found', filename = filename)
+        self.send_error(1, 'File Not Found', filename = filename)
         return False
 
     def parse_options(self):
@@ -146,7 +143,7 @@ class AbstractClient(object):
       # Implementations need to set self.filesize here
       pass
 
-    def newRequest(self):
+    def new_request(self):
         '''
             When receiving a read request from the parent socket, open our
             own socket and check the read request; if we don't have any options,
@@ -176,7 +173,7 @@ class AbstractClient(object):
         # we got some options so ACK those first
         self.reply_options()
 
-    def sendError(self, code = 1, message = 'File Not Found', filename = ''):
+    def send_error(self, code = 1, message = 'File Not Found', filename = ''):
         '''
             Sends an error code and string to a client. See RFC1350, page 10 for
             details.
@@ -213,7 +210,7 @@ class AbstractClient(object):
         [opcode] = struct.unpack('!H', self.message[:2])
         if opcode == 1:
             self.message = self.message[2:]
-            self.newRequest()
+            self.new_request()
         elif opcode == 4:
             [block] = struct.unpack('!H', self.message[2:4])
             if block == 0:
@@ -253,15 +250,13 @@ class FileBackedClient(AbstractClient):
     def complete(self):
         '''Closes a file after sending it.'''
         super(FileBackedClient, self).complete()
-        try:
-            self.fh.close()
-        except AttributeError:
-            # we have not opened yet or file-not-found
-            pass
+        if self.fh is None:
+          return
+        self.fh.close()
 
     def next_block(self):
         '''Return the next block to send to the client.'''
-        if not self.fh:
+        if self.fh is None:
           return None
         return self.fh.read(self.blksize)
 
@@ -315,7 +310,9 @@ class BaseTFTPD(object):
             for sock in rlist:
                 if sock == self.sock:
                     # main socket, so new client
-                    self.ongoing.append(self.client_cls(sock, self))
+                    client = self.client_cls(sock, self)
+                    self.ongoing.append(client)
+                    client.handle()
                 else:
                     # client socket, so tell the client object it's ready
                     sock.parent.ready()
