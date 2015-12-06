@@ -4,6 +4,7 @@ This file contains classes and functions that implement the PyPXE DHCP service
 
 '''
 
+import abc
 import socket
 import struct
 import os
@@ -11,20 +12,29 @@ import logging
 from collections import defaultdict
 from time import time
 
-class OutOfLeasesError(Exception):
+
+class Error(Exception):
     pass
 
 
-class DHCPD:
+class OutOfLeasesError(Error):
+    pass
+
+
+class AbstractDHCPD(object):
     '''
         This class implements a DHCP Server, limited to PXE options.
         Implemented from RFC2131, RFC2132,
         https://en.wikipedia.org/wiki/Dynamic_Host_Configuration_Protocol,
         and http://www.pix.net/software/pxeboot/archive/pxespec.pdf.
     '''
+
+    __metaclass__ = abc.ABCMeta
+
     def __init__(self, **server_settings):
 
         self.ip = server_settings.get('ip', '192.168.2.2')
+        self.interface = server_settings.get('interface', '')
         self.port = server_settings.get('port', 67)
         self.offer_from = server_settings.get('offer_from', '192.168.2.100')
         self.offer_to = server_settings.get('offer_to', '192.168.2.150')
@@ -33,15 +43,6 @@ class DHCPD:
         self.dns_server = server_settings.get('dns_server', '8.8.8.8')
         self.broadcast = server_settings.get('broadcast', '<broadcast>')
         self.file_server = server_settings.get('file_server', '192.168.2.2')
-        self.file_name = server_settings.get('file_name', '')
-        if not self.file_name:
-            self.force_file_name = False
-            self.file_name = 'pxelinux.0'
-        else:
-            self.force_file_name = True
-        self.ipxe = server_settings.get('use_ipxe', False)
-        self.http = server_settings.get('use_http', False)
-        self.mode_proxy = server_settings.get('mode_proxy', False) # ProxyDHCP mode
         self.static_config = server_settings.get('static_config', dict())
         self.whitelist = server_settings.get('whitelist', False)
         self.mode_debug = server_settings.get('mode_debug', False) # debug mode
@@ -58,42 +59,31 @@ class DHCPD:
         if self.mode_debug:
             self.logger.setLevel(logging.DEBUG)
 
-        if self.http and not self.ipxe:
-            self.logger.warning('HTTP selected but iPXE disabled. PXE ROM must support HTTP requests.')
-        if self.ipxe and self.http:
-            self.file_name = 'http://{0}/{1}'.format(self.file_server, self.file_name)
-        if self.ipxe and not self.http:
-            self.file_name = 'tftp://{0}/{1}'.format(self.file_server, self.file_name)
-
         self.logger.debug('NOTICE: DHCP server started in debug mode. DHCP server is using the following:')
         self.logger.debug('DHCP Server IP: {0}'.format(self.ip))
         self.logger.debug('DHCP Server Port: {0}'.format(self.port))
 
-        # debug info for ProxyDHCP mode
-        if not self.mode_proxy:
-            self.logger.debug('Lease Range: {0} - {1}'.format(self.offer_from, self.offer_to))
-            self.logger.debug('Subnet Mask: {0}'.format(self.subnet_mask))
-            self.logger.debug('Router: {0}'.format(self.router))
-            self.logger.debug('DNS Server: {0}'.format(self.dns_server))
-            self.logger.debug('Broadcast Address: {0}'.format(self.broadcast))
+        self.logger.debug('Lease Range: {0} - {1}'.format(self.offer_from, self.offer_to))
+        self.logger.debug('Subnet Mask: {0}'.format(self.subnet_mask))
+        self.logger.debug('Router: {0}'.format(self.router))
+        self.logger.debug('DNS Server: {0}'.format(self.dns_server))
+        self.logger.debug('Broadcast Address: {0}'.format(self.broadcast))
 
         if self.static_config:
             self.logger.debug('Using Static Leasing')
             self.logger.debug('Using Static Leasing Whitelist: {0}'.format(self.whitelist))
 
         self.logger.debug('File Server IP: {0}'.format(self.file_server))
-        self.logger.debug('File Name: {0}'.format(self.file_name))
-        self.logger.debug('ProxyDHCP Mode: {0}'.format(self.mode_proxy))
-        self.logger.debug('Using iPXE: {0}'.format(self.ipxe))
-        self.logger.debug('Using HTTP Server: {0}'.format(self.http))
 
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-        self.sock.bind(('', self.port ))
+        # SO_BINDTODEVICE
+        self.sock.setsockopt(socket.SOL_SOCKET, 25, self.interface + '\0')
+        self.sock.bind(('', self.port))
 
         # key is MAC
-        self.leases = defaultdict(lambda: {'ip': '', 'expire': 0, 'ipxe': self.ipxe})
+        self.leases = defaultdict(lambda: {'ip': '', 'expire': 0})
 
     def get_namespaced_static(self, path, fallback = {}):
         statics = self.static_config
@@ -169,33 +159,23 @@ class DHCPD:
 
         # op, htype, hlen, hops, xid
         response =  struct.pack('!BBBB4s', 2, 1, 6, 0, xid)
-        if not self.mode_proxy:
-            response += struct.pack('!HHI', 0, 0, 0) # secs, flags, ciaddr
-        else:
-            response += struct.pack('!HHI', 0, 0x8000, 0)
-        if not self.mode_proxy:
-            if self.leases[client_mac]['ip']: # OFFER
-                offer = self.leases[client_mac]['ip']
-            else: # ACK
-                offer = self.get_namespaced_static('dhcp.binding.{0}.ipaddr'.format(self.get_mac(client_mac)))
-                offer = offer if offer else self.next_ip()
-                self.leases[client_mac]['ip'] = offer
-                self.leases[client_mac]['expire'] = time() + 86400
-                self.logger.info('New Assignment - MAC: {0} -> IP: {1}'.format(self.get_mac(client_mac), self.leases[client_mac]['ip']))
-            response += socket.inet_aton(offer) # yiaddr
-        else:
-            response += socket.inet_aton('0.0.0.0')
+        response += struct.pack('!HHI', 0, 0, 0) # secs, flags, ciaddr
+        if self.leases[client_mac]['ip']: # OFFER
+            offer = self.leases[client_mac]['ip']
+        else: # ACK
+            offer = self.get_namespaced_static('dhcp.binding.{0}.ipaddr'.format(self.get_mac(client_mac)))
+            offer = offer if offer else self.next_ip()
+            self.leases[client_mac]['ip'] = offer
+            self.leases[client_mac]['expire'] = time() + 86400
+            self.logger.info('New Assignment - MAC: {0} -> IP: {1}'.format(self.get_mac(client_mac), self.leases[client_mac]['ip']))
+        response += socket.inet_aton(offer) # yiaddr
         response += socket.inet_aton(self.file_server) # siaddr
         response += socket.inet_aton('0.0.0.0') # giaddr
         response += chaddr # chaddr
 
         # BOOTP legacy pad
         response += chr(0) * 64 # server name
-        if self.mode_proxy:
-            response += self.file_name
-            response += chr(0) * (128 - len(self.file_name))
-        else:
-            response += chr(0) * 128
+        response += chr(0) * 128
         response += self.magic # magic section
         return (client_mac, response)
 
@@ -209,43 +189,25 @@ class DHCPD:
         '''
         response = self.tlv_encode(53, chr(opt53)) # message type, OFFER
         response += self.tlv_encode(54, socket.inet_aton(self.ip)) # DHCP Server
-        if not self.mode_proxy:
-            subnet_mask = self.get_namespaced_static('dhcp.binding.{0}.subnet'.format(self.get_mac(client_mac)), self.subnet_mask)
-            response += self.tlv_encode(1, socket.inet_aton(subnet_mask)) # subnet mask
-            router = self.get_namespaced_static('dhcp.binding.{0}.router'.format(self.get_mac(client_mac)), self.router)
-            response += self.tlv_encode(3, socket.inet_aton(router)) # router
-            dns_server = self.get_namespaced_static('dhcp.binding.{0}.dns'.format(self.get_mac(client_mac)), [self.dns_server])
-            dns_server = ''.join([socket.inet_aton(i) for i in dns_server])
-            response += self.tlv_encode(6, dns_server)
-            response += self.tlv_encode(51, struct.pack('!I', 86400)) # lease time
+        subnet_mask = self.get_namespaced_static('dhcp.binding.{0}.subnet'.format(self.get_mac(client_mac)), self.subnet_mask)
+        response += self.tlv_encode(1, socket.inet_aton(subnet_mask)) # subnet mask
+        router = self.get_namespaced_static('dhcp.binding.{0}.router'.format(self.get_mac(client_mac)), self.router)
+        response += self.tlv_encode(3, socket.inet_aton(router)) # router
+        dns_server = self.get_namespaced_static('dhcp.binding.{0}.dns'.format(self.get_mac(client_mac)), [self.dns_server])
+        dns_server = ''.join([socket.inet_aton(i) for i in dns_server])
+        response += self.tlv_encode(6, dns_server)
+        response += self.tlv_encode(51, struct.pack('!I', 86400)) # lease time
 
         # TFTP Server OR HTTP Server; if iPXE, need both
         response += self.tlv_encode(66, self.file_server)
-
-        # file_name null terminated
-        if not self.ipxe or not self.leases[client_mac]['ipxe']:
-            # http://www.syslinux.org/wiki/index.php/PXELINUX#UEFI
-            if 93 in self.leases[client_mac]['options'] and not self.force_file_name:
-                [arch] = struct.unpack("!H", self.leases[client_mac]['options'][93][0])
-                if arch == 0: # BIOS/default
-                    response += self.tlv_encode(67, 'pxelinux.0' + chr(0))
-                elif arch == 6: # EFI IA32
-                    response += self.tlv_encode(67, 'syslinux.efi32' + chr(0))
-                elif arch == 7: # EFI BC, x86-64 (according to the above link)
-                    response += self.tlv_encode(67, 'syslinux.efi64' + chr(0))
-                elif arch == 9: # EFI x86-64
-                    response += self.tlv_encode(67, 'syslinux.efi64' + chr(0))
-            else:
-                response += self.tlv_encode(67, self.file_name + chr(0))
-        else:
-            response += self.tlv_encode(67, 'chainload.kpxe' + chr(0)) # chainload iPXE
-            if opt53 == 5: # ACK
-                self.leases[client_mac]['ipxe'] = False
-        if self.mode_proxy:
-            response += self.tlv_encode(60, 'PXEClient')
-            response += struct.pack('!BBBBBBB4sB', 43, 10, 6, 1, 0b1000, 10, 4, chr(0) + 'PXE', 0xff)
+        response += self.tlv_encode(67, self.filename(client_mac) + chr(0))
         response += '\xff'
         return response
+
+    @abc.abstractmethod
+    def filename(self, client_mac):
+        '''Return the filename to use for the request.'''
+        pass
 
     def dhcp_offer(self, message):
         '''This method responds to DHCP discovery with offer.'''
@@ -315,9 +277,6 @@ class DHCPD:
                     self.dhcp_offer(message)
                 except OutOfLeasesError:
                     self.logger.critical('Ran out of leases')
-            elif type == 3 and address[0] == '0.0.0.0' and not self.mode_proxy:
-                self.logger.info('Received DHCPACK')
-                self.dhcp_ack(message)
-            elif type == 3 and address[0] != '0.0.0.0' and self.mode_proxy:
+            elif type == 3 and address[0] == '0.0.0.0':
                 self.logger.info('Received DHCPACK')
                 self.dhcp_ack(message)
