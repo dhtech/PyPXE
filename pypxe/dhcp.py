@@ -44,7 +44,6 @@ class AbstractDHCPD(object):
         self.broadcast = server_settings.get('broadcast', '<broadcast>')
         self.file_server = server_settings.get('file_server', '192.168.2.2')
         self.static_config = server_settings.get('static_config', dict())
-        self.whitelist = server_settings.get('whitelist', False)
         self.mode_debug = server_settings.get('mode_debug', False) # debug mode
         self.logger = server_settings.get('logger', None)
         self.magic = struct.pack('!I', 0x63825363) # magic cookie
@@ -243,17 +242,6 @@ class AbstractDHCPD(object):
         self.logger.debug('<--END RESPONSE-->')
         self.sock.sendto(response, (self.broadcast, 68))
 
-    def validate_req(self, client_mac):
-        # client request is valid only if contains Vendor-Class = PXEClient
-        if self.whitelist and self.get_mac(client_mac) not in self.get_namespaced_static('dhcp.binding'):
-            self.logger.info('Non-whitelisted client request received')
-            return False
-        if 60 in self.leases[client_mac]['options'] and 'PXEClient' in self.leases[client_mac]['options'][60][0]:
-            self.logger.info('PXE client request received')
-            return True
-        self.logger.info('Non-PXE client request received')
-        return False
-
     def listen(self):
         '''Main listen loop.'''
         while True:
@@ -268,8 +256,6 @@ class AbstractDHCPD(object):
             self.logger.debug('<--BEGIN OPTIONS-->')
             self.logger.debug('{0}'.format(repr(self.leases[client_mac]['options'])))
             self.logger.debug('<--END OPTIONS-->')
-            if not self.validate_req(client_mac):
-                continue
             type = ord(self.leases[client_mac]['options'][53][0]) # see RFC2131, page 10
             if type == 1:
                 self.logger.info('Received DHCPOFFER')

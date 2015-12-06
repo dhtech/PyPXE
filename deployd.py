@@ -54,6 +54,8 @@ class DHCPD(dhcp.AbstractDHCPD):
 class DNSD(dns.AbstractDNSD):
 
   def lookup(self, qtype, domain):
+    if qtype != 'A':
+      return tuple()
     if domain == 'ftp.se.debian.org.':
       return (A('77.80.231.70'), )
     else:
