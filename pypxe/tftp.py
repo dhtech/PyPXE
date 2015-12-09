@@ -304,22 +304,25 @@ class BaseTFTPD(object):
     def listen(self):
         '''This method listens for incoming requests.'''
         while True:
-            # remove complete clients to select doesn't fail
-            map(self.ongoing.remove, [client for client in self.ongoing if client.dead])
-            rlist, _, _ = select.select([self.sock] + [client.sock for client in self.ongoing if not client.dead], [], [], 0)
-            for sock in rlist:
-                if sock == self.sock:
-                    # main socket, so new client
-                    client = self.client_cls(sock, self)
-                    self.ongoing.append(client)
-                    client.handle()
-                else:
-                    # client socket, so tell the client object it's ready
-                    sock.parent.ready()
-            # if we haven't recieved an ACK in timeout time, retry
-            [client.send_block() for client in self.ongoing if client.no_ack()]
-            # if we have run out of retries, kill the client
-            [client.complete() for client in self.ongoing if client.no_retries()]
+            try:
+                # remove complete clients to select doesn't fail
+                map(self.ongoing.remove, [client for client in self.ongoing if client.dead])
+                rlist, _, _ = select.select([self.sock] + [client.sock for client in self.ongoing if not client.dead], [], [], 0)
+                for sock in rlist:
+                    if sock == self.sock:
+                        # main socket, so new client
+                        client = self.client_cls(sock, self)
+                        self.ongoing.append(client)
+                        client.handle()
+                    else:
+                        # client socket, so tell the client object it's ready
+                        sock.parent.ready()
+                # if we haven't recieved an ACK in timeout time, retry
+                [client.send_block() for client in self.ongoing if client.no_ack()]
+                # if we have run out of retries, kill the client
+                [client.complete() for client in self.ongoing if client.no_retries()]
+            except:
+                self.logger.exception('listen loop exception')
 
 
 class TFTPD(BaseTFTPD):
