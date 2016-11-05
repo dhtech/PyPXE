@@ -57,9 +57,12 @@ class DNSD(dns.AbstractDNSD):
     if qtype != 'A':
       return tuple()
     if domain == 'ftp.se.debian.org.':
-      return (A('77.80.231.70'), )
+      return (A('10.32.12.1'), )
     else:
-      return (A(socket.gethostbyname(domain)),)
+      try:
+        return (A(socket.gethostbyname(domain)),)
+      except:
+        return tuple()
 
 if __name__ == '__main__':
   # setup main logger
@@ -74,7 +77,7 @@ if __name__ == '__main__':
   sys_logger.info('Starting TFTP server...')
 
   tftp_server = TFTPD(
-      ip='77.80.231.70',
+      ip='10.32.12.1',
       logger=tftp_logger)
   tftpd = threading.Thread(target=tftp_server.listen)
   tftpd.daemon = True
@@ -83,15 +86,15 @@ if __name__ == '__main__':
   dhcp_logger = sys_logger.getChild('dhcp')
   sys_logger.info('Starting DHCP server...')
   dhcp_server = DHCPD(
-      interface='deploy0',
-      ip='77.80.231.70',
-      offer_from='77.80.231.71',
-      offer_to='77.80.231.94',
-      subnet_mask='255.255.255.224',
-      router='77.80.231.65',
-      dns_server='77.80.231.70',
-      broadcast='77.80.231.95',
-      file_server='77.80.231.70',
+      interface='vlan552',
+      ip='10.32.12.1',
+      offer_from='10.32.12.10',
+      offer_to='10.32.12.250',
+      subnet_mask='255.255.255.0',
+      router='10.32.12.1',
+      dns_server='10.32.12.1',
+      broadcast='10.32.12.255',
+      file_server='10.32.12.1',
       logger=dhcp_logger)
 
   dhcpd = threading.Thread(target = dhcp_server.listen)
@@ -102,7 +105,7 @@ if __name__ == '__main__':
   sys_logger.info('Starting DNS server...')
 
   dns_server = DNSD(
-      ip='77.80.231.70',
+      ip='10.32.12.1',
       logger=dns_logger)
   dns_server = threading.Thread(target=dns_server.listen)
   dns_server.daemon = True
